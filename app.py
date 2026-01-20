@@ -31,10 +31,6 @@ DEFAULT_PARAMS = {
     'smooth': 3,
     'threshold': 0.005,
     'min_holding': 3,
-    'persistence_days': 3,    # [New] 必须连续第一的天数
-    'vol_filter_active': True, # [New] 是否启用成交量过滤
-    'vol_window': 20,         # [New] 成交量均线
-    'vol_min_ratio': 0.6,     # [New] 量比阈值
     'allow_cash': True,
     'mom_method': 'Risk-Adjusted (稳健)', 
     'selected_codes': DEFAULT_CODES
@@ -65,8 +61,8 @@ def save_config(config):
 # 1. 投行级页面配置 & CSS样式 (UI优化版)
 # ==========================================
 st.set_page_config(
-    page_title="AlphaTarget | 核心资产轮动策略终端 (Pro)",
-    page_icon="🛡️",
+    page_title="AlphaTarget | 核心资产轮动策略终端",
+    page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -179,6 +175,20 @@ PRESET_ETFS = {
     "512480": "半导体ETF (行业)", "512880": "证券ETF (Beta)"
 }
 
+# 辅助函数：根据名称生成柔和的颜色
+def get_color_from_name(name):
+    if name == 'Cash':
+        return 'rgba(200, 200, 200, 0.2)' 
+    hash_obj = hashlib.md5(name.encode())
+    hex_dig = hash_obj.hexdigest()
+    r = int(hex_dig[0:2], 16)
+    g = int(hex_dig[2:4], 16)
+    b = int(hex_dig[4:6], 16)
+    r = (r + 255) // 2
+    g = (g + 255) // 2
+    b = (b + 255) // 2
+    return f'rgba({r}, {g}, {b}, 0.25)' 
+
 def metric_html(label, value, sub="", color="#2c3e50"):
     return f"""
     <div class="metric-card">
@@ -189,7 +199,7 @@ def metric_html(label, value, sub="", color="#2c3e50"):
     """
 
 # ==========================================
-# 2. 数据层 (Data Layer) - 包含成交量
+# 2. 数据层 (Data Layer) - 纯净历史数据版
 # ==========================================
 
 @st.cache_data(ttl=3600*12) 
@@ -204,11 +214,10 @@ def get_all_etf_list():
 @st.cache_data(ttl=3600*4)
 def download_market_data(codes_list, end_date_str):
     """
-    增强版数据下载：支持收盘价和成交量
+    纯净历史数据下载，不进行实时融合
     """
     start_str = '20150101' 
     price_dict = {}
-    vol_dict = {}
     name_map = {}
     
     etf_list = get_all_etf_list()
@@ -229,62 +238,40 @@ def download_market_data(codes_list, end_date_str):
                 df['日期'] = pd.to_datetime(df['日期'])
                 df.set_index('日期', inplace=True)
                 price_dict[name] = df['收盘'].astype(float)
-                vol_dict[name] = df['成交量'].astype(float)
         except Exception:
             continue
 
     if not price_dict:
-        return None, None, None
+        return None, None
 
-    data_price = pd.concat(price_dict, axis=1).sort_index().ffill()
-    data_vol = pd.concat(vol_dict, axis=1).sort_index().fillna(0)
-    
-    # 对齐
-    common_idx = data_price.index.intersection(data_vol.index)
-    data_price = data_price.loc[common_idx]
-    data_vol = data_vol.loc[common_idx]
-    
-    data_price.dropna(how='all', inplace=True)
-    if len(data_price) < 20: return None, None, None
-    return data_price, data_vol, name_map
+    data = pd.concat(price_dict, axis=1).sort_index().ffill()
+    data.dropna(how='all', inplace=True)
+    if len(data) < 20: return None, None
+    return data, name_map
 
 # ==========================================
 # 3. 策略内核 (Strategy Core)
 # ==========================================
 
-def calculate_momentum(price_df, vol_df, lookback, smooth, method='Classic (普通)', 
-                      vol_filter_active=False, vol_window=20, vol_min_ratio=0.6):
-    
-    # 1. 动量计算
+def calculate_momentum(data, lookback, smooth, method='Classic (普通)'):
     if method == 'Classic (普通)':
-        mom = price_df.pct_change(lookback)
+        mom = data.pct_change(lookback)
     elif method == 'Risk-Adjusted (稳健)':
-        ret = price_df.pct_change(lookback)
-        vol = price_df.pct_change().rolling(lookback).std()
+        ret = data.pct_change(lookback)
+        vol = data.pct_change().rolling(lookback).std()
         mom = ret / (vol + 1e-9)
     elif method == 'MA Distance (趋势)':
-        ma = price_df.rolling(lookback).mean()
-        mom = (price_df / ma) - 1
+        ma = data.rolling(lookback).mean()
+        mom = (data / ma) - 1
     else:
-        mom = price_df.pct_change(lookback)
+        mom = data.pct_change(lookback)
 
     if smooth > 1:
         mom = mom.rolling(smooth).mean()
         
-    # 2. 成交量过滤 (Volume Filter)
-    if vol_filter_active and vol_df is not None:
-        vol_ma = vol_df.rolling(vol_window).mean()
-        vol_ratio = vol_df / (vol_ma + 1e-9)
-        # 如果缩量严重 (ratio < 0.6)，则屏蔽动量信号
-        low_vol_mask = vol_ratio < vol_min_ratio
-        mom = mom.mask(low_vol_mask, -np.inf) # 设置为负无穷，使其无法成为第一
-
     return mom
 
-def fast_backtest_vectorized(daily_ret, mom_df, threshold, min_holding=1, persistence_days=1, cost_rate=0.0001, allow_cash=True):
-    """
-    向量化快速回测 (含 Persistence 逻辑) - 用于优化器
-    """
+def fast_backtest_vectorized(daily_ret, mom_df, threshold, min_holding=1, cost_rate=0.0001, allow_cash=True):
     signal_mom = mom_df.shift(1)
     n_days, n_assets = daily_ret.shape
     p_ret = daily_ret.values
@@ -295,10 +282,6 @@ def fast_backtest_vectorized(daily_ret, mom_df, threshold, min_holding=1, persis
     trade_count = 0
     days_held = 0 
     
-    # Persistence 状态
-    candidate_idx = -2
-    candidate_days = 0
-    
     for i in range(n_days):
         if curr_idx != -2:
             days_held += 1
@@ -307,46 +290,27 @@ def fast_backtest_vectorized(daily_ret, mom_df, threshold, min_holding=1, persis
         if np.isnan(row_mom).all(): continue
             
         clean_mom = np.nan_to_num(row_mom, nan=-np.inf)
-        
-        # 1. 当日最佳
         best_idx = np.argmax(clean_mom)
         best_val = clean_mom[best_idx]
-        
-        # 2. 更新候选者
-        if best_idx == candidate_idx:
-            candidate_days += 1
-        else:
-            candidate_idx = best_idx
-            candidate_days = 1
-            
         target_idx = curr_idx
         
-        # A. 绝对风控 (Cash) - 优先级最高，不用等 Persistence
         if allow_cash and best_val < 0:
             target_idx = -1
-            candidate_idx = -1 # 重置候选
-            candidate_days = 0
         else:
-            # B. 相对优势切换
-            is_candidate_ready = (candidate_days >= persistence_days)
-            
             if curr_idx == -2:
-                # 建仓
                 if best_val > -np.inf: target_idx = best_idx
             elif curr_idx == -1:
-                # 抄底：需要确认
-                if is_candidate_ready: target_idx = candidate_idx
+                if best_val > 0 or (not allow_cash): target_idx = best_idx
             else:
-                # 换仓
-                if days_held >= min_holding:
-                    # 只有当候选者成熟 且 优势显著 时才换
-                    if is_candidate_ready and (candidate_idx != curr_idx):
+                is_stop_loss = (target_idx == -1) 
+                if not is_stop_loss:
+                    if days_held >= min_holding:
                         curr_val = clean_mom[curr_idx]
-                        cand_val = clean_mom[candidate_idx]
-                        if cand_val > curr_val + threshold:
-                            target_idx = candidate_idx
+                        if best_idx != curr_idx:
+                            if best_val > curr_val + threshold:
+                                target_idx = best_idx
                     else:
-                        target_idx = curr_idx # 保持
+                        target_idx = curr_idx
         
         if target_idx != curr_idx:
             if curr_idx != -2:
@@ -402,13 +366,13 @@ def calculate_pro_metrics(equity_curve, benchmark_curve, trade_count):
         "Alpha": alpha, "Beta": beta, "Trades": trade_count
     }
 
-def optimize_parameters(price_df, vol_df, allow_cash, min_holding, persistence_days, vol_filter_active):
+def optimize_parameters(data, allow_cash, min_holding):
     methods = ['Classic (普通)', 'Risk-Adjusted (稳健)', 'MA Distance (趋势)']
-    lookbacks = range(20, 31, 2) 
-    smooths = range(2, 6, 1)      
-    thresholds = np.arange(0.001, 0.008, 0.002)
+    lookbacks = range(20, 31, 1) 
+    smooths = range(1, 8, 1)     
+    thresholds = np.arange(0.0, 0.013, 0.001)
     
-    daily_ret = price_df.pct_change().fillna(0)
+    daily_ret = data.pct_change().fillna(0)
     n_days = len(daily_ret) 
     results = []
     
@@ -419,12 +383,11 @@ def optimize_parameters(price_df, vol_df, allow_cash, min_holding, persistence_d
     for method in methods:
         for lb in lookbacks:
             for sm in smooths:
-                mom = calculate_momentum(price_df, vol_df, lb, sm, method, vol_filter_active, 20, 0.6)
+                mom = calculate_momentum(data, lb, sm, method)
                 for th in thresholds:
                     ret, dd, equity, count = fast_backtest_vectorized(
                         daily_ret, mom, th, 
                         min_holding=min_holding,
-                        persistence_days=persistence_days,
                         cost_rate=TRANSACTION_COST, 
                         allow_cash=allow_cash
                     )
@@ -444,7 +407,7 @@ def optimize_parameters(price_df, vol_df, allow_cash, min_holding, persistence_d
                     results.append([method, lb, sm, th, ret, ann_ret, count, ann_trades, dd, sharpe, score])
                     
                     idx += 1
-                    if idx % 100 == 0:
+                    if idx % 200 == 0:
                         my_bar.progress(min(idx / total_iters, 1.0))
                     
     my_bar.empty()
@@ -491,9 +454,11 @@ def main():
         selected_codes = [x.split(" | ")[0] for x in selected_display]
         
         st.divider()
-        st.subheader("2. 资金管理 (SIP/Lump)")
+        st.subheader("2. 资金管理")
         
         date_mode = st.radio("回测区间", ["全历史", "自定义"], index=0)
+        
+        # [修改] 默认开始时间改为 2021-01-01
         start_date_input = datetime(2021, 1, 1)
         end_date_input = datetime.now()
         
@@ -537,17 +502,8 @@ def main():
             p_threshold = st.number_input("换仓阈值", 0.0, 0.05, st.session_state.params.get('threshold', 0.005), step=0.001, format="%.3f")
             
             st.markdown("---")
-            st.markdown("**🛑 风控与确认 (核心升级)**")
-            
-            c_p3, c_p4 = st.columns(2)
-            with c_p3:
-                p_min_holding = st.number_input("最小持仓天数", min_value=1, max_value=60, value=st.session_state.params.get('min_holding', 3), step=1)
-            with c_p4:
-                # [New] Persistence Input
-                p_persistence = st.number_input("榜首确认天数", min_value=1, max_value=10, value=st.session_state.params.get('persistence_days', 3), step=1, help="标的必须连续N天排名第一才可触发调仓")
-            
-            st.markdown("**📊 量价增强**")
-            p_vol_active = st.checkbox("启用缩量过滤 (Volume Check)", value=st.session_state.params.get('vol_filter_active', True))
+            st.markdown("**🛑 风控参数**")
+            p_min_holding = st.number_input("最小持仓天数", min_value=1, max_value=60, value=st.session_state.params.get('min_holding', 3), step=1)
             p_allow_cash = st.checkbox("启用绝对动量避险 (Cash Protection)", value=st.session_state.params.get('allow_cash', True))
             
             submit_btn = st.form_submit_button("🚀 确认并运行 (Run Analysis)")
@@ -555,10 +511,7 @@ def main():
         if submit_btn:
             current_params = {
                 'lookback': p_lookback, 'smooth': p_smooth, 'threshold': p_threshold,
-                'min_holding': p_min_holding, 'allow_cash': p_allow_cash, 
-                'persistence_days': p_persistence, # Save new param
-                'vol_filter_active': p_vol_active,
-                'selected_codes': selected_codes,
+                'min_holding': p_min_holding, 'allow_cash': p_allow_cash, 'selected_codes': selected_codes,
                 'mom_method': p_method 
             }
             if current_params != st.session_state.params:
@@ -582,24 +535,22 @@ def main():
         st.warning("请选择标的。")
         st.stop()
         
-    with st.spinner("正在加载历史行情与成交量数据..."):
-        # 下载 Price + Volume
-        price_data, vol_data, name_map = download_market_data(selected_codes, end_date.strftime('%Y%m%d'))
+    with st.spinner("正在加载历史行情数据 (Historical Data Only)..."):
+        # [修改] 使用简单的历史下载函数
+        raw_data, name_map = download_market_data(selected_codes, end_date.strftime('%Y%m%d'))
         
-    if price_data is None:
+    if raw_data is None:
         st.error("数据不足或下载失败。")
         st.stop()
 
-    # 数据切片
+    daily_ret_all = raw_data.pct_change().fillna(0)
     mom_method_curr = st.session_state.params.get('mom_method', 'Classic (普通)')
-    # 计算动量 (带 Vol 过滤)
-    mom_all = calculate_momentum(price_data, vol_data, p_lookback, p_smooth, mom_method_curr, 
-                                vol_filter_active=p_vol_active, vol_window=20, vol_min_ratio=0.6)
+    mom_all = calculate_momentum(raw_data, p_lookback, p_smooth, mom_method_curr)
     
-    mask = (price_data.index >= start_date) & (price_data.index <= end_date)
-    sliced_data = price_data.loc[mask]
+    mask = (raw_data.index >= start_date) & (raw_data.index <= end_date)
+    sliced_data = raw_data.loc[mask]
     sliced_mom = mom_all.loc[mask] 
-    sliced_ret = sliced_data.pct_change().fillna(0)
+    sliced_ret = daily_ret_all.loc[mask]
     
     if sliced_data.empty:
         st.error("区间内无数据")
@@ -608,16 +559,12 @@ def main():
     signal_mom = sliced_mom.shift(1)
     dates = sliced_ret.index
     
-    # === 回测逻辑 (完整版: 含SIP + Persistence) ===
+    # === 回测逻辑 ===
     cash = initial_capital
     share_val = 0.0
     curr_hold = None
     days_held = 0
     current_hold_start_val = 0.0 
-    
-    # [New] Persistence 变量
-    candidate_hold = None
-    candidate_days = 0
     
     holdings_history = []
     total_assets_curve = []
@@ -630,7 +577,7 @@ def main():
     for i, date in enumerate(dates):
         r_today = sliced_ret.loc[date]
         
-        # A. 定投 (SIP)
+        # A. 定投
         if invest_mode == "定期定额 (SIP)" and i > 0:
             is_sip_day = False
             if sip_freq.startswith("每月"):
@@ -646,50 +593,26 @@ def main():
         # B. 信号
         if curr_hold is not None: days_held += 1
         row = signal_mom.loc[date]
-        target = curr_hold # 默认为保持
+        target = curr_hold
         
         if not row.isna().all():
             clean_row = row.fillna(-np.inf)
-            
-            # 1. 找出当日理论第一
             best_asset = clean_row.idxmax()
             best_score = clean_row.max()
             
-            # 2. 更新候选者 (Candidate)
-            if best_asset == candidate_hold:
-                candidate_days += 1
-            else:
-                candidate_hold = best_asset
-                candidate_days = 1
-                
-            # 3. 判断切换
-            # 绝对风控 (Cash)
             if p_allow_cash and best_score < 0:
                 target = 'Cash'
-                candidate_hold = 'Cash' # 重置候选
-                candidate_days = 0
             else:
-                # 相对动量
                 if curr_hold is None or curr_hold == 'Cash':
-                    # 建仓/抄底
-                    if best_score > -np.inf: 
-                        # 如果是从空仓进入，也建议检查 persistence，防止假突破
-                        if curr_hold == 'Cash' and candidate_days >= p_persistence:
-                            target = candidate_hold
-                        elif curr_hold is None: # 初始建仓，宽松一点
-                             target = best_asset
+                    target = best_asset
                 else:
-                    # 持仓切换
                     if days_held >= p_min_holding:
-                        # 检查候选者是否成熟 (Persistence)
-                        if candidate_days >= p_persistence:
-                            if candidate_hold != curr_hold:
-                                curr_score = clean_row.get(curr_hold, -np.inf)
-                                cand_score = clean_row.get(candidate_hold, -np.inf)
-                                if cand_score > curr_score + p_threshold:
-                                    target = candidate_hold
-        
-        # 资金结算
+                        curr_score = clean_row.get(curr_hold, -np.inf)
+                        if best_asset != curr_hold:
+                            if best_score > curr_score + p_threshold: target = best_asset
+                    else:
+                        target = curr_hold
+
         day_return = 0.0
         if curr_hold and curr_hold != 'Cash' and curr_hold in r_today:
             day_return = r_today[curr_hold]
@@ -758,8 +681,11 @@ def main():
         '持仓': holdings_history
     }, index=dates)
     
-    # 计算净值用于指标
-    df_res['策略净值'] = df_res['总资产'] / df_res['总资产'].iloc[0] 
+    _, _, nav_series, _ = fast_backtest_vectorized(
+        sliced_ret, sliced_mom, p_threshold, 
+        min_holding=p_min_holding, cost_rate=TRANSACTION_COST, allow_cash=p_allow_cash
+    )
+    df_res['策略净值'] = nav_series
     bm_curve = (1 + sliced_ret.mean(axis=1)).cumprod()
     
     # 信号栏
@@ -772,13 +698,14 @@ def main():
         lock_msg = f"(已持仓 {days_held} 天)" if last_hold != 'Cash' else ""
         if days_held < p_min_holding and last_hold != 'Cash': lock_msg += " 🔒 **锁定中**"
         
-        data_last_date = price_data.index[-1].strftime('%Y-%m-%d')
+        # [修改] 简化显示，移除实时数据标签
+        data_last_date = raw_data.index[-1].strftime('%Y-%m-%d')
         
         st.markdown(f"""
         <div class="signal-banner">
             <h3 style="margin:0">📌 当前持仓: {hold_name}</h3>
             <div style="margin-top:5px; font-size: 0.9rem">
-                逻辑: {mom_method_curr} | 榜首确认: {p_persistence}天 | 最小持仓: {p_min_holding}天 | 缩量过滤: {"ON" if p_vol_active else "OFF"}
+                逻辑: {mom_method_curr} | 最小持仓: {p_min_holding} 天 {lock_msg} | 数据截止: {data_last_date}
             </div>
         </div>""", unsafe_allow_html=True)
         
@@ -798,15 +725,10 @@ def main():
         )
         
         if st.button("运行全参数扫描 (Method/L/S/T)"):
-            data_to_opt_p = sliced_data if opt_source.startswith("当前") else price_data
-            data_to_opt_v = sliced_mom if opt_source.startswith("当前") else vol_data # 这里偷懒传了vol_data/mom不太对，重新计算
-            
-            # 重新为优化器准备数据
-            target_p = sliced_data if opt_source.startswith("当前") else price_data
-            target_v = vol_data.loc[target_p.index] if vol_data is not None else None
-            
-            with st.spinner(f"正在基于 [{opt_source}] 进行四维全景扫描..."):
-                opt_df = optimize_parameters(target_p, target_v, p_allow_cash, p_min_holding, p_persistence, p_vol_active)
+            data_to_opt = sliced_data if opt_source.startswith("当前") else raw_data
+            # [修改] 使用新的不带 method 参数的 optimize_parameters (内部自带循环)
+            with st.spinner(f"正在基于 [{opt_source}] 进行四维全景扫描 (约 3000+ 次回测)..."):
+                opt_df = optimize_parameters(data_to_opt, p_allow_cash, p_min_holding)
                 st.session_state.opt_results = opt_df 
         
         if st.session_state.opt_results is not None:
@@ -836,7 +758,9 @@ def main():
                 st.rerun()
 
             c1, c2, c3 = st.columns(3)
+            # 简写 helper
             def short_method(m): return m.split(" ")[0]
+
             is_same = (best_r['方法'] == best_s['方法'] and int(best_r['周期']) == int(best_s['周期']) and int(best_r['平滑']) == int(best_s['平滑']) and best_r['阈值'] == best_s['阈值'])
             note_str = " (参数重合)" if is_same else ""
 
@@ -846,7 +770,9 @@ def main():
                 st.write(f"**年化:** `{best_r['年化收益']:.1%}`")
                 st.write(f"**夏普:** `{best_r['夏普比率']:.2f}`")
                 st.write(f"**调仓:** `{best_r['年化调仓']:.1f}次/年`")
-                if st.button("💾 应用 (收益)", key="btn_apply_ret"): apply_params(best_r)
+                st.caption(f"配置: {p_str}")
+                if st.button("💾 应用 (收益)", key="btn_apply_ret"):
+                    apply_params(best_r)
 
             with c2:
                 st.markdown(f'<div class="opt-highlight">💎 <b>夏普优先</b>{note_str}</div>', unsafe_allow_html=True)
@@ -854,9 +780,12 @@ def main():
                 st.write(f"**年化:** `{best_s['年化收益']:.1%}`")
                 st.write(f"**夏普:** `{best_s['夏普比率']:.2f}`")
                 st.write(f"**调仓:** `{best_s['年化调仓']:.1f}次/年`")
+                st.caption(f"配置: {p_str_s}")
                 if not is_same: 
-                    if st.button("💾 应用 (夏普)", key="btn_apply_sharpe"): apply_params(best_s)
-                else: st.caption("与左侧参数一致")
+                    if st.button("💾 应用 (夏普)", key="btn_apply_sharpe"):
+                        apply_params(best_s)
+                else:
+                    st.caption("与左侧参数一致")
                     
             with c3:
                 st.markdown('<div class="opt-highlight">🐢 <b>最佳低频 (<20次/年)</b></div>', unsafe_allow_html=True)
@@ -865,10 +794,13 @@ def main():
                     st.write(f"**年化:** `{best_low['年化收益']:.1%}`")
                     st.write(f"**夏普:** `{best_low['夏普比率']:.2f}`")
                     st.write(f"**调仓:** `{best_low['年化调仓']:.1f}次/年`")
-                    if st.button("💾 应用 (低频)", key="btn_apply_low"): apply_params(best_low)
-                else: st.warning("无满足条件的组合")
+                    st.caption(f"配置: {p_str_l}")
+                    if st.button("💾 应用 (低频)", key="btn_apply_low"):
+                        apply_params(best_low)
+                else:
+                    st.warning("无满足条件的组合")
 
-            st.caption("🌌 参数空间映射 (X:周期, Y:阈值, Color:年化调仓) [3D Visualization Restored]")
+            st.caption("🌌 参数空间映射 (X:周期, Y:阈值, Color:年化调仓) [已展示全部方法]")
             fig_3d = px.scatter_3d(
                 opt_df, 
                 x='周期', y='阈值', z='平滑',
@@ -909,6 +841,7 @@ def main():
 
     tab1, tab2, tab3 = st.tabs(["📈 综合图表", "📅 年度/月度回报", "📝 交易日记"])
     with tab1:
+        # [New] Asset Overlay Selection
         st.caption("📉 标的走势叠加 (Asset Overlays)")
         all_assets = sliced_data.columns.tolist()
         overlay_assets = st.multiselect(
@@ -919,36 +852,116 @@ def main():
         )
 
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3], specs=[[{"secondary_y": False}], [{"secondary_y": False}]])
-        fig.add_trace(go.Scatter(x=df_res.index, y=df_res['总资产'], name="策略总资产", line=dict(color='#c0392b', width=2)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df_res.index, y=df_res['投入本金'], name="投入本金", line=dict(color='#bdc3c7', dash='dash')), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_res.index, y=df_res['策略净值'], name="策略净值", line=dict(color='#c0392b', width=2)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_res.index, y=bm_curve, name="基准", line=dict(color='#95a5a6', dash='dash')), row=1, col=1)
         
-        # Overlay Logic
-        if overlay_assets:
-            base_val = df_res['总资产'].iloc[0]
-            for asset in overlay_assets:
-                # Normalize asset to start at same value as strategy for comparison
-                asset_series = sliced_data[asset]
-                norm_asset = asset_series / asset_series.iloc[0] * base_val
-                fig.add_trace(go.Scatter(x=df_res.index, y=norm_asset, name=f"{name_map.get(asset, asset)} (Norm)", opacity=0.5), row=1, col=1)
+        # Add Asset Traces
+        colors = px.colors.qualitative.Plotly
+        for i, asset in enumerate(overlay_assets):
+            s = sliced_data[asset]
+            # Normalize to 1.0 at start (or first valid) then scale to strategy start? 
+            # Standard comparison: normalize to 1.0 at day 0. Strategy also starts (implied) from 1.0 base.
+            if not s.empty:
+                first_valid = s.first_valid_index()
+                if first_valid:
+                    # Normalize: s / s[0] * strategy[0] (to align starting points visually)
+                    # Strategy net value[0] is (1+ret[0]). Let's align to 1.0 roughly.
+                    base_val = df_res['策略净值'].iloc[0] if not df_res['策略净值'].empty else 1.0
+                    s_norm = (s / s.loc[first_valid]) * base_val
+                    
+                    fig.add_trace(go.Scatter(
+                        x=s.index, y=s_norm, 
+                        name=f"{asset} (Normalized)", 
+                        mode='lines',
+                        line=dict(width=1, dash='dot'),
+                        opacity=0.7
+                    ), row=1, col=1)
 
-        # Drawdown Area
-        dd_series = (df_res['总资产'] / df_res['总资产'].cummax() - 1)
-        fig.add_trace(go.Scatter(x=df_res.index, y=dd_series, name="回撤", fill='tozeroy', line=dict(width=0.5, color='#e74c3c')), row=2, col=1)
+        drawdown_series = (df_res['策略净值'] - df_res['策略净值'].cummax()) / df_res['策略净值'].cummax()
+        fig.add_trace(go.Scatter(x=df_res.index, y=drawdown_series, name="回撤", fill='tozeroy', line=dict(color='#c0392b', width=1)), row=2, col=1)
         
-        fig.update_layout(height=600, hovermode="x unified")
+        df_res['持仓名称'] = df_res['持仓'].map(lambda x: name_map.get(x, x))
+        df_res['持仓变化'] = df_res['持仓'] != df_res['持仓'].shift(1)
+        change_indices = df_res[df_res['持仓变化']].index.tolist()
+        if df_res.index[0] not in change_indices: change_indices.insert(0, df_res.index[0])
+        change_indices.append(df_res.index[-1] + timedelta(days=1))
+        
+        shapes = []
+        for i in range(len(change_indices) - 1):
+            start_t = change_indices[i]
+            end_t = change_indices[i+1]
+            try:
+                if start_t > df_res.index[-1]: continue
+                current_code = df_res.loc[start_t, '持仓']
+                current_name = df_res.loc[start_t, '持仓名称']
+                color = get_color_from_name(current_code)
+                shapes.append(dict(type="rect", xref="x", yref="paper", x0=start_t, x1=end_t, y0=0, y1=1, fillcolor=color, opacity=0.3, layer="below", line_width=0))
+                mid_point = start_t + (end_t - start_t) / 2
+                if (end_t - start_t).days > 15: 
+                    fig.add_annotation(x=mid_point, y=0.05, xref="x", yref="paper", text=current_name.split(' ')[0], showarrow=False, font=dict(size=10, color="gray"), opacity=0.7)
+            except Exception: pass
+        fig.update_layout(shapes=shapes, height=600, title_text="策略综合分析", hovermode="x unified", xaxis=dict(rangeslider=dict(visible=False), type="date"))
         st.plotly_chart(fig, use_container_width=True)
         
     with tab2:
-        # Simple Yearly table
-        df_res['Year'] = df_res.index.year
-        yearly = df_res.groupby('Year')['总资产'].agg(['first', 'last'])
-        yearly['Return'] = yearly['last'] / yearly['first'] - 1
-        st.dataframe(yearly.style.format({'first':'{:.2f}', 'last':'{:.2f}', 'Return':'{:.2%}'}))
+        res_y = []
+        years = df_res.index.year.unique()
+        for y in years:
+            d_sub = df_res[df_res.index.year == y]
+            if d_sub.empty: continue
+            y_ret = d_sub['策略净值'].iloc[-1] / d_sub['策略净值'].iloc[0] - 1
+            b_ret = bm_curve.loc[d_sub.index[-1]] / bm_curve.loc[d_sub.index[0]] - 1
+            res_y.append({"年份": y, "策略收益": y_ret, "基准收益": b_ret, "超额(Alpha)": y_ret - b_ret})
+        st.caption("📅 年度盈亏")
+        st.dataframe(pd.DataFrame(res_y).set_index("年份").style.format("{:+.2%}").background_gradient(subset=["超额(Alpha)"], cmap="RdYlGn", vmin=-0.2, vmax=0.2), use_container_width=True)
         
+        st.caption("🗓️ 月度盈亏矩阵")
+        df_nav = df_res['策略净值'].resample('ME').last()
+        monthly_rets = df_nav.pct_change().fillna(0)
+        monthly_data = []
+        for date, val in monthly_rets.items():
+            monthly_data.append({'Year': date.year, 'Month': date.month, 'Return': val})
+        df_month = pd.DataFrame(monthly_data)
+        pivot_month = df_month.pivot(index='Year', columns='Month', values='Return')
+        for m in range(1, 13):
+            if m not in pivot_month.columns: pivot_month[m] = np.nan
+        pivot_month = pivot_month.sort_index(ascending=False).sort_index(axis=1)
+        fig_m = px.imshow(pivot_month, labels=dict(x="月份", y="年份", color="收益率"), x=[f"{i}月" for i in range(1, 13)], color_continuous_scale="RdYlGn", color_continuous_midpoint=0.0, text_auto=".1%")
+        fig_m.update_layout(height=400)
+        st.plotly_chart(fig_m, use_container_width=True)
+
     with tab3:
-        st.subheader("📝 交易流水")
-        df_log = pd.DataFrame(daily_details)
-        st.dataframe(df_log.sort_values('日期', ascending=False), height=500)
+        st.markdown("##### 📝 详细交易日记 (Heatmap Mode)")
+        df_details = pd.DataFrame(daily_details)
+        if not df_details.empty:
+            df_details['段内收益'] = df_details['段内收益'] * 100
+            
+            asset_cols = sorted([col for col in df_details.columns if col not in ["日期", "当前持仓", "持仓天数", "段内收益", "操作", "总资产", "全市场表现"]])
+            
+            for ac in asset_cols:
+                df_details[ac] = df_details[ac] * 100
+            
+            col_config = {
+                "持仓天数": st.column_config.NumberColumn("持仓天数", help="当前连续持仓天数"),
+                "段内收益": st.column_config.NumberColumn("段内收益", help="本段持仓期间的累计收益率", format="%.2f%%"),
+                "操作": st.column_config.TextColumn("调仓操作", width="medium"),
+                "总资产": st.column_config.NumberColumn("总资产", format="%.2f"),
+                "日期": st.column_config.DateColumn("日期", format="YYYY-MM-DD"),
+            }
+            
+            for ac in asset_cols:
+                col_config[ac] = st.column_config.NumberColumn(ac, format="%.2f%%")
+
+            final_cols = ["日期"] + asset_cols + ["当前持仓", "持仓天数", "段内收益", "总资产", "操作"]
+            df_show = df_details[final_cols]
+
+            st.dataframe(
+                df_show.sort_values(by="日期", ascending=False).style
+                .format({ac: "{:+.2f}" for ac in asset_cols}) 
+                .background_gradient(subset=asset_cols, cmap="RdYlGn_r", vmin=-3.0, vmax=3.0), 
+                use_container_width=True,
+                column_config=col_config
+            )
 
 if __name__ == "__main__":
     main()
